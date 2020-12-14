@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+
+from urllib.parse import urlparse, parse_qsl
+
+
+def main(args, input_file):
+    params, skip_empty = args.params, args.skip_empty
+
+    for line in input_file:
+        parsed = urlparse(line)
+        query = parsed.query
+        query_params = parse_qsl(query)
+
+        if skip_empty and len(query_params) == 0:
+            continue
+
+        if args.strip_values:
+            query_params = [(k, v.strip()) for k, v in query_params]
+
+        print('\t'.join([k.strip() + '=' + v.strip() for k, v in query_params if k in params]))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('params', nargs='+')
+    parser.add_argument('--skip-empty', action='store_true', default=False)
+    parser.add_argument('--strip-values', action='store_true', default=False)
+    parser.add_argument('--input', nargs='?', type=argparse.FileType('r'))
+    args = parser.parse_args()
+
+    if not args.input:
+        args.input = [sys.stdin]
+
+    for i in args.input:
+        main(args, i)
