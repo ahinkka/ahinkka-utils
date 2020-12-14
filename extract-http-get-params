@@ -13,14 +13,15 @@ def main(args, input_file):
         parsed = urlparse(line)
         query = parsed.query
         query_params = parse_qsl(query)
+        filtered = [(k, v) for k, v in query_params if k in params]
 
-        if skip_empty and len(query_params) == 0:
+        if skip_empty and len(filtered) == 0:
             continue
 
         if args.strip_values:
-            query_params = [(k, v.strip()) for k, v in query_params]
+            filtered = [(k, v.strip()) for k, v in filtered]
 
-        print('\t'.join([k.strip() + '=' + v.strip() for k, v in query_params if k in params]))
+        print('\t'.join(k + '=' + v for k, v in filtered))
 
 
 if __name__ == '__main__':
