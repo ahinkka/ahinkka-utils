@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+
+
+def main(args, input_file):
+    field_indices, separator, quote_char, output_separator = args.fields, args.separator, args.quote_char, args.output_separator
+
+    for line in input_file:
+        parts = line.split(separator)
+        parts[-1] = parts[-1].strip('\n')
+
+        result = []
+        tmp = []
+        for part in parts:
+            if len(tmp) == 0 and part.startswith(quote_char):
+                tmp.append(part[1:])
+            elif len(tmp) > 0 and part.endswith(quote_char):
+                tmp.append(part[:-1])
+                result.append(separator.join(tmp))
+                tmp = []
+            elif len(tmp) > 0:
+                tmp.append(part)
+            else:
+                result.append(part)
+
+        picked = []
+        for i in field_indices:
+            picked.append(result[i])
+
+        print(output_separator.join(picked))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('fields', nargs='+', type=int)
+    parser.add_argument('--separator', default=' ', type=str)
+    parser.add_argument('--quote-char', default='"', type=str)
+    parser.add_argument('--output-separator', default='\t', type=str)
+    parser.add_argument('--input', nargs='?', type=argparse.FileType('r'))
+    args = parser.parse_args()
+
+    if not args.input:
+        args.input = [sys.stdin]
+
+    for i in args.input:
+        main(args, i)
