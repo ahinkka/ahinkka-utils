@@ -29,9 +29,12 @@ base="$BACKUP_BASE_DIR/$selected_base"
 dest="$BACKUP_BASE_DIR/$today"
 src="$DIR_TO_BACKUP/"
 
-echo "Selected base backup to hardlink to: $base"
-echo "New backup: $dest"
-echo "Source: $src"
+>&2 echo "Selected base backup to hardlink to: $base"
+>&2 echo "New backup: $dest"
+>&2 echo "Source: $src"
+
+>&2 echo "The following command will be run after 5 seconds..."
+>&2 echo rsync -avv --delete --link-dest="$base" "$src" "$dest"
 
 sleep 5
 
