@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+
+import argparse
+import curses
+import gzip
+import logging
+import os
+import signal
+import sys
+from typing import Iterable, List, Optional, Tuple
+
+
+logger = logging.getLogger(__name__)
+
+
+# Standard CloudFront fields, in fixed order per:
+# https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logs-reference.html#BasicDistributionFileFormat
+CLOUDFRONT_FIELDS = [
+    "date",
+    "time",
+    "x-edge-location",
+    "sc-bytes",
+    "c-ip",
+    "cs-method",
+    "cs(Host)",
+    "cs-uri-stem",
+    "sc-status",
+    "cs(Referer)",
+    "cs(User-Agent)",
+    "cs-uri-query",
+    "cs(Cookie)",
+    "x-edge-result-type",
+    "x-edge-request-id",
+    "x-host-header",
+    "cs-protocol",
+    "cs-bytes",
+    "time-taken",
+    "x-forwarded-for",
+    "ssl-protocol",
+    "ssl-cipher",
+    "x-edge-response-result-type",
+    "cs-protocol-version",
+    "fle-status",
+    "fle-encrypted-fields",
+    "c-port",
+    "time-to-first-byte",
+    "x-edge-detailed-result-type",
+    "sc-content-type",
+    "sc-content-len",
+    "sc-range-start",
+    "sc-range-end",
+]
+
+CLOUDFRONT_FIELD_INDEX = {name: i for i, name in enumerate(CLOUDFRONT_FIELDS)}
+
+
+def _is_probably_gzip_path(path: str) -> bool:
+    return path.lower().endswith(".gz")
+
+
+def _open_maybe_gzip_text(path: str):
+    # Accept '-' as stdin (already text stream).
+    if path == "-":
+        return sys.stdin
+
+    # Fast path: .gz extension -> gzip
+    if _is_probably_gzip_path(path):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+
+    # Otherwise, peek at magic bytes
+    with open(path, "rb") as f:
+        magic = f.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+
+    return open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def _iter_input_paths(args) -> List[str]:
+    paths: List[str] = []
+
+    if args.input:
+        for inp in args.input:
+            if inp == "-":
+                paths.append("-")
+                continue
+
+            if os.path.isdir(inp):
+                for name in sorted(os.listdir(inp)):
+                    p = os.path.join(inp, name)
+                    if os.path.isfile(p) and name.lower().endswith(".gz"):
+                        paths.append(p)
+                continue
+
+            paths.append(inp)
+
+    if not paths:
+        # Default to stdin
+        paths = ["-"]
+
+    return paths
+
+
+def _indices_for_fields(selected_fields: List[str]) -> List[int]:
+    missing = [f for f in selected_fields if f not in CLOUDFRONT_FIELD_INDEX]
+    if missing:
+        raise ValueError(f"Unknown field(s): {', '.join(missing)}")
+    return [CLOUDFRONT_FIELD_INDEX[f] for f in selected_fields]
+
+
+def _extract_from_stream(
+    input_stream,
+    indices: List[int],
+    output_separator: str,
+    progress_every_lines: Optional[int] = None,
+    progress_label: Optional[str] = None,
+) -> None:
+    line_no = 0
+    for raw in input_stream:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+
+        if line.startswith("#"):
+            continue
+
+        line_no += 1
+        if progress_every_lines and progress_label and (line_no % progress_every_lines == 0):
+            print(f"# {progress_label}: line {line_no}", file=sys.stderr, flush=True)
+
+        parts = line.split("\t")
+        # If the line is shorter than expected, pad with empty strings
+        max_idx = max(indices) if indices else -1
+        if len(parts) <= max_idx:
+            parts.extend([""] * (max_idx + 1 - len(parts)))
+
+        picked = [parts[i] for i in indices]
+        try:
+            print(output_separator.join(picked))
+        except BrokenPipeError:
+            # Behave like a normal UNIX filter (e.g. when piped to `head`).
+            raise
+
+
+def _load_preview_rows(paths: List[str], max_rows: int = 5) -> List[List[str]]:
+    rows: List[List[str]] = []
+
+    for p in paths:
+        with _open_maybe_gzip_text(p) as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    continue
+                rows.append(line.split("\t"))
+                if len(rows) >= max_rows:
+                    return rows
+
+    return rows
+
+
+class _CursesUI:
+    def __init__(
+        self,
+        all_fields: List[str],
+        initial_selected: Optional[List[str]],
+        preview_rows: List[List[str]],
+        output_separator: str,
+    ):
+        self.all_fields = all_fields
+        self.selected = set(initial_selected or [])
+        self.cursor = 0
+        self.preview_rows = preview_rows
+        self.output_separator = output_separator
+
+    def run(self) -> Optional[List[str]]:
+        return curses.wrapper(self._main)
+
+    def _main(self, stdscr) -> Optional[List[str]]:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+
+            help_line = "↑/↓: move  SPACE: toggle  ENTER/ESC: exit"
+            title = "CloudFront Field Selector"
+            stdscr.addstr(0, 0, (title[: width - 1] if width > 1 else ""))
+            stdscr.addstr(1, 0, (help_line[: width - 1] if width > 1 else ""))
+
+            # split: top (fields) and bottom (preview)
+            preview_height = min(8, max(3, height // 3))
+            fields_height = max(0, height - preview_height - 3)
+            start_y = 3
+
+            # fields list
+            visible = max(1, fields_height)
+            top = min(max(0, self.cursor - visible // 2), max(0, len(self.all_fields) - visible))
+            bottom = min(len(self.all_fields), top + visible)
+
+            for idx in range(top, bottom):
+                y = start_y + (idx - top)
+                field = self.all_fields[idx]
+                mark = "x" if field in self.selected else " "
+                line = f"[{mark}] {field}"
+                if idx == self.cursor:
+                    stdscr.addstr(y, 0, line[: width - 1], curses.A_REVERSE)
+                else:
+                    stdscr.addstr(y, 0, line[: width - 1])
+
+            # preview
+            preview_y = start_y + fields_height + 1
+            if preview_y < height:
+                stdscr.addstr(preview_y, 0, ("Preview (first rows):"[: width - 1] if width > 1 else ""))
+
+            selected_list = [f for f in self.all_fields if f in self.selected]
+            if selected_list:
+                indices = _indices_for_fields(selected_list)
+            else:
+                indices = []
+
+            for i, row in enumerate(self.preview_rows):
+                y = preview_y + 1 + i
+                if y >= height:
+                    break
+                max_idx = max(indices) if indices else -1
+                if len(row) <= max_idx:
+                    row = row + [""] * (max_idx + 1 - len(row))
+                picked = [row[j] for j in indices] if indices else []
+                out = self.output_separator.join(picked)
+                stdscr.addstr(y, 0, out[: width - 1])
+
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (curses.KEY_UP, ord("k")):
+                self.cursor = (self.cursor - 1) % len(self.all_fields)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                self.cursor = (self.cursor + 1) % len(self.all_fields)
+            elif ch == ord(" "):
+                f = self.all_fields[self.cursor]
+                if f in self.selected:
+                    self.selected.remove(f)
+                else:
+                    self.selected.add(f)
+            elif ch in (27, curses.KEY_ENTER, 10, 13):
+                return [f for f in self.all_fields if f in self.selected]
+
+
+def _reconstruct_command(argv0: str, selected_fields: List[str], args) -> str:
+    cmd: List[str] = [os.path.basename(argv0)]
+    cmd.extend(selected_fields)
+
+    # Preserve relevant arguments from invocation
+    if args.input:
+        cmd.append("--input")
+        cmd.extend(args.input)
+    if args.output_separator != "\t":
+        cmd.extend(["--output-separator", args.output_separator])
+    if args.verbose:
+        cmd.append("--verbose")
+
+    return " ".join(_shell_quote(x) for x in cmd)
+
+
+def _shell_quote(s: str) -> str:
+    # Simple POSIX-ish quoting for safety when users copy/paste.
+    if s == "":
+        return "''"
+    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/:")
+    if all(c in safe for c in s):
+        return s
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def main(args) -> None:
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    if args.list_fields:
+        for f in CLOUDFRONT_FIELDS:
+            print(f)
+        return
+
+    paths = _iter_input_paths(args)
+    progress_label = os.path.basename(sys.argv[0])
+
+    if args.interactive:
+        # Interactive mode requires stable, re-runnable inputs (files/dirs).
+        # If input is a stream (stdin/"-"), fail fast and clearly.
+        if "-" in paths:
+            raise SystemExit("--interactive requires file/directory inputs, not stdin ('-') / piped data.")
+
+        preview_rows = _load_preview_rows(paths, max_rows=5)
+        ui = _CursesUI(
+            all_fields=CLOUDFRONT_FIELDS,
+            initial_selected=args.fields if args.fields else None,
+            preview_rows=preview_rows,
+            output_separator=args.output_separator,
+        )
+        selected = ui.run()
+        # Always print the reproducing command (even if user selected zero fields).
+        print(_reconstruct_command(sys.argv[0], selected or [], args), flush=True)
+        return
+
+    if not args.fields:
+        raise SystemExit("No fields specified. Provide field names, or use --interactive / --list-fields.")
+
+    indices = _indices_for_fields(args.fields)
+    total_files = len([p for p in paths if p != "-"])
+    file_idx = 0
+    for p in paths:
+        if p != "-":
+            file_idx += 1
+            if args.progress:
+                print(f"# {progress_label}: file {file_idx}/{total_files}", file=sys.stderr, flush=True)
+
+        with _open_maybe_gzip_text(p) as f:
+            _extract_from_stream(
+                f,
+                indices,
+                args.output_separator,
+                progress_every_lines=(10000 if (args.progress and p == "-") else None),
+                progress_label=progress_label,
+            )
+    return
+
+
+if __name__ == "__main__":
+    # Make SIGPIPE behave like typical UNIX tools (avoid BrokenPipeError stack traces).
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("fields", nargs="*", help="Field names to extract (e.g. date c-ip sc-status)")
+    parser.add_argument(
+        "--input",
+        nargs="*",
+        help="Input path(s): files, directories (expanded to *.gz), or '-' for stdin.",
+    )
+    parser.add_argument("--output-separator", default="\t", type=str)
+    parser.add_argument("--interactive", "-i", action="store_true", default=False)
+    parser.add_argument("--list-fields", action="store_true", default=False)
+    parser.add_argument("--verbose", action="store_true", default=False)
+    parser.add_argument("--progress", action="store_true", default=False)
+    args = parser.parse_args()
+
+    try:
+        sys.exit(main(args))
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+
