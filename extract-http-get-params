@@ -12,6 +12,8 @@ def main(args, input_file):
     for line in input_file:
         parsed = urlparse(line)
         query = parsed.query
+        if query == '':
+            query = line
         query_params = parse_qsl(query)
         filtered = [(k, v) for k, v in query_params if k in params]
 
